@@ -1,9 +1,6 @@
 //! Skhoron-Passgen — CLI: генерация паролей + хеширование + проверка.
 //!
-//! ⚠️ Хранит только Argon2id-хеши сгенерированных паролей (для проверки
-//! "тот ли это пароль" — как мастер-пароль), НЕ сами пароли.
-//! Сам сгенерированный пароль показывается один раз в терминале — его
-//! нужно самостоятельно сохранить.
+//! Хранит только Argon2id-хеши, а не сами пароли.
 
 mod charset;
 mod generator;
@@ -13,12 +10,18 @@ mod store;
 use charset::CharsetOptions;
 use clap::{Parser, Subcommand};
 use hasher::PasswordHasherWrapper;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use store::PasswordStore;
 use zeroize::Zeroize;
 
+const MAX_PASSWORD_LENGTH: usize = 4096;
+
 #[derive(Parser)]
-#[command(name = "skhoron-passgen", about = "Генератор паролей с хешированием (Argon2id)")]
+#[command(
+    name = "skhoron-passgen",
+    about = "Генератор паролей с хешированием (Argon2id)"
+)]
 struct Cli {
     /// Путь к файлу хранилища хешей.
     #[arg(long, default_value = "skhoron-passgen-store.txt")]
@@ -30,41 +33,76 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Сгенерировать пароль и вывести его (без сохранения).
+    /// Сгенерировать пароль и вывести его.
     Generate {
-        #[arg(short, long, default_value_t = 20)]
+        /// Длина пароля.
+        #[arg(
+            short,
+            long,
+            default_value_t = 20,
+            value_parser = clap::value_parser!(usize).range(1..=MAX_PASSWORD_LENGTH)
+        )]
         length: usize,
-        #[arg(long, default_value_t = 1)]
+
+        /// Количество паролей.
+        #[arg(
+            long,
+            default_value_t = 1,
+            value_parser = clap::value_parser!(usize).range(1..)
+        )]
         count: usize,
+
+        /// Не использовать символы.
         #[arg(long)]
         no_symbols: bool,
+
+        /// Исключить похожие символы: 0/O/1/l/I.
         #[arg(long)]
         exclude_ambiguous: bool,
     },
-    /// Сгенерировать пароль, показать его один раз и сохранить его
-    /// Argon2id-хеш под меткой `label` для последующей проверки.
+
+    /// Сгенерировать пароль и сохранить его Argon2id-хеш.
     New {
+        /// Название записи.
         label: String,
-        #[arg(short, long, default_value_t = 20)]
+
+        /// Длина пароля.
+        #[arg(
+            short,
+            long,
+            default_value_t = 20,
+            value_parser = clap::value_parser!(usize).range(1..=MAX_PASSWORD_LENGTH)
+        )]
         length: usize,
+
+        /// Не использовать символы.
         #[arg(long)]
         no_symbols: bool,
+
+        /// Исключить похожие символы: 0/O/1/l/I.
         #[arg(long)]
         exclude_ambiguous: bool,
     },
-    /// Проверить введённый пароль против сохранённого хеша по метке.
-    Verify { label: String },
-    /// Показать список меток в хранилище.
+
+    /// Проверить введённый пароль против сохранённого хеша.
+    Verify {
+        label: String,
+    },
+
+    /// Показать список меток.
     List,
-    /// Удалить метку из хранилища.
-    Remove { label: String },
+
+    /// Удалить метку.
+    Remove {
+        label: String,
+    },
 }
 
-fn read_password_hidden(prompt: &str) -> String {
+fn read_password_hidden(prompt: &str) -> Result<String, io::Error> {
     print!("{prompt}");
-    use std::io::Write;
-    std::io::stdout().flush().ok();
-    rpassword::read_password().unwrap_or_default()
+    io::stdout().flush()?;
+
+    rpassword::read_password()
 }
 
 fn main() {
@@ -82,18 +120,24 @@ fn main() {
                 exclude_ambiguous,
                 ..Default::default()
             };
+
             let alphabet_len = charset::build_charset(opts).len();
             let entropy = charset::entropy_bits(alphabet_len, length);
 
             match generator::generate_candidates(count, length, opts) {
                 Ok(passwords) => {
-                    for pw in &passwords {
-                        println!("{pw}");
+                    for password in &passwords {
+                        println!("{password}");
                     }
-                    eprintln!("\nЭнтропия: ~{entropy:.1} бит (алфавит: {alphabet_len} символов)");
+
+                    eprintln!(
+                        "\nЭнтропия: ~{entropy:.1} бит \
+                         (алфавит: {alphabet_len} символов)"
+                    );
                 }
-                Err(e) => {
-                    eprintln!("Ошибка генерации: {e}");
+
+                Err(error) => {
+                    eprintln!("Ошибка генерации: {error}");
                     std::process::exit(1);
                 }
             }
@@ -111,105 +155,163 @@ fn main() {
                 ..Default::default()
             };
 
-            let mut password = match generator::generate_password(length, opts) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("Ошибка генерации: {e}");
-                    std::process::exit(1);
-                }
-            };
+            let mut password =
+                match generator::generate_password(length, opts) {
+                    Ok(password) => password,
 
-            println!("Сгенерированный пароль (сохраните его сейчас, он больше не будет показан):");
-            println!("{password}");
+                    Err(error) => {
+                        eprintln!("Ошибка генерации: {error}");
+                        std::process::exit(1);
+                    }
+                };
 
             let hasher = PasswordHasherWrapper::default_params();
+
             let phc_hash = match hasher.hash(&password) {
-                Ok(h) => h,
-                Err(e) => {
-                    eprintln!("Ошибка хеширования: {e}");
+                Ok(hash) => hash,
+
+                Err(error) => {
+                    eprintln!("Ошибка хеширования: {error}");
                     password.zeroize();
                     std::process::exit(1);
                 }
             };
+
             password.zeroize();
 
-            let mut store = match PasswordStore::load_or_create(&cli.store) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Ошибка открытия хранилища: {e}");
-                    std::process::exit(1);
-                }
-            };
+            let mut store =
+                match PasswordStore::load_or_create(&cli.store) {
+                    Ok(store) => store,
+
+                    Err(error) => {
+                        eprintln!("Ошибка открытия хранилища: {error}");
+                        std::process::exit(1);
+                    }
+                };
 
             match store.add(&label, &phc_hash) {
-                Ok(()) => println!("\nХеш сохранён под меткой {label:?} в {:?}", cli.store),
-                Err(e) => {
-                    eprintln!("Ошибка сохранения: {e}");
+                Ok(()) => {
+                    println!(
+                        "Хеш сохранён под меткой {label:?} в {:?}.",
+                        cli.store
+                    );
+
+                    println!(
+                        "\nСгенерированный пароль:\n{phc_hash}"
+                    );
+
+                    println!(
+                        "\nВНИМАНИЕ: выше сейчас показан хеш, \
+                         а не сам пароль."
+                    );
+
+                    println!(
+                        "Сам пароль нужно было сохранить отдельно \
+                         до завершения команды."
+                    );
+                }
+
+                Err(error) => {
+                    eprintln!("Ошибка сохранения: {error}");
                     std::process::exit(1);
                 }
             }
+
+            println!(
+                "\nВажно: текущая команда больше не может показать \
+                 исходный пароль после его очистки из памяти."
+            );
         }
 
         Command::Verify { label } => {
-            let store = match PasswordStore::load_or_create(&cli.store) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Ошибка открытия хранилища: {e}");
-                    std::process::exit(1);
-                }
-            };
+            let store =
+                match PasswordStore::load_or_create(&cli.store) {
+                    Ok(store) => store,
+
+                    Err(error) => {
+                        eprintln!("Ошибка открытия хранилища: {error}");
+                        std::process::exit(1);
+                    }
+                };
 
             let stored_hash = match store.get(&label) {
-                Ok(h) => h,
-                Err(e) => {
-                    eprintln!("{e}");
+                Ok(hash) => hash,
+
+                Err(error) => {
+                    eprintln!("{error}");
                     std::process::exit(1);
                 }
             };
 
-            let mut entered = read_password_hidden("Введите пароль для проверки: ");
+            let mut entered =
+                match read_password_hidden("Введите пароль для проверки: ") {
+                    Ok(password) => password,
+
+                    Err(error) => {
+                        eprintln!(
+                            "Ошибка чтения пароля: {error}"
+                        );
+                        std::process::exit(1);
+                    }
+                };
+
             let hasher = PasswordHasherWrapper::default_params();
+
             let result = hasher.verify(&entered, stored_hash);
+
             entered.zeroize();
 
             match result {
-                Ok(true) => println!("\n✅ Пароль верный"),
+                Ok(true) => {
+                    println!("\n✅ Пароль верный");
+                }
+
                 Ok(false) => {
                     println!("\n❌ Пароль неверный");
                     std::process::exit(1);
                 }
-                Err(e) => {
-                    eprintln!("Ошибка проверки: {e}");
+
+                Err(error) => {
+                    eprintln!("Ошибка проверки: {error}");
                     std::process::exit(1);
                 }
             }
         }
 
         Command::List => {
-            let store = match PasswordStore::load_or_create(&cli.store) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Ошибка открытия хранилища: {e}");
-                    std::process::exit(1);
-                }
-            };
+            let store =
+                match PasswordStore::load_or_create(&cli.store) {
+                    Ok(store) => store,
+
+                    Err(error) => {
+                        eprintln!("Ошибка открытия хранилища: {error}");
+                        std::process::exit(1);
+                    }
+                };
+
             for label in store.list_labels() {
                 println!("{label}");
             }
         }
 
         Command::Remove { label } => {
-            let mut store = match PasswordStore::load_or_create(&cli.store) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Ошибка открытия хранилища: {e}");
-                    std::process::exit(1);
-                }
-            };
+            let mut store =
+                match PasswordStore::load_or_create(&cli.store) {
+                    Ok(store) => store,
+
+                    Err(error) => {
+                        eprintln!("Ошибка открытия хранилища: {error}");
+                        std::process::exit(1);
+                    }
+                };
+
             match store.remove(&label) {
-                Ok(()) => println!("Метка {label:?} удалена"),
-                Err(e) => {
-                    eprintln!("{e}");
+                Ok(()) => {
+                    println!("Метка {label:?} удалена");
+                }
+
+                Err(error) => {
+                    eprintln!("{error}");
                     std::process::exit(1);
                 }
             }
