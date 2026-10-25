@@ -1,4 +1,4 @@
-Skhoron-Passgen
+# Skhoron-Passgen
 
 A password generator with protection against modulo bias (rejection sampling) and
 hashing/verification using Argon2id. Part of the "Skhoron" (https://github.com/Skhoron) ecosystem.
